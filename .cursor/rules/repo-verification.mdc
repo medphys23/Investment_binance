@@ -1,0 +1,26 @@
+---
+alwaysApply: true
+---
+
+# Investment repo verification
+
+Run these after changing app logic, indicators, Binance data access, or signal rules:
+
+```powershell
+python -m unittest discover -s tests
+python -m compileall app.py src tests
+```
+
+For a UI smoke check:
+
+```powershell
+python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+Then open `http://127.0.0.1:8501` and verify Binance market data loads.
+
+For a worker smoke check:
+
+```powershell
+python -m src.paper_worker --once
+```

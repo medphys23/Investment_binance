@@ -1,0 +1,23 @@
+---
+alwaysApply: true
+---
+
+# Investment repo core rules
+
+This repo inherits global Cursor/Codex rules from `~/.cursor/rules/` and `~/.codex/AGENTS.md`. Repo `AGENTS.md` is the local source of truth and must stay in sync with this file.
+
+- Purpose: local read-only Binance technical signal dashboard.
+- Never add authenticated exchange access, API keys, real trading execution, order management, withdrawals, or automated exchange trading.
+- Local paper-trade tracking is allowed only when it uses live Binance public market prices, not synthetic market data or manual trade uploads.
+- Paper trades are spot-style long simulations only. Bearish setups are `risk_off` / `avoid`, never shorts.
+- Keep the always-on worker and dashboard sharing SQLite at `data/paper_bot.sqlite`.
+- Simulated leverage is research-only and capped at `10x`.
+- Keep predictions scenario-based with confidence, confluence, invalidation, and likely zones only.
+- Treat Elliott Wave detection as probabilistic.
+- Preserve `6h`, `8h`, and `12h` as first-class regime filters.
+- Use USDC quote pairs for tracked coins unless the user explicitly requests a different quote asset.
+- Keep the key comparison matrix focused on `1h`, `4h`, `12h`, `1d`, and `1w`.
+- Keep data access in `src/binance_client.py`, calculations in `src/indicators.py`, signal logic in `src/signals.py`, worker logic in `src/paper_worker.py`, storage in `src/storage.py`, and UI in `app.py`.
+- Spot market data should use the configured base URL fallback chain, with `data-api.binance.vision` preferred to avoid regional `451` failures from `api.binance.com`.
+- Futures context is optional and must not block the app when `/fapi` endpoints are region-restricted.
+- Do not commit unless the user asks.
