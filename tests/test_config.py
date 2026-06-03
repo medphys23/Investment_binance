@@ -11,8 +11,8 @@ class ConfigTest(unittest.TestCase):
     def test_key_timeframes_are_locked_for_comparison(self) -> None:
         self.assertEqual(KEY_TIMEFRAMES, ["1h", "4h", "12h", "1d", "1w"])
 
-    def test_dashboard_tabs_are_split_between_signals_and_trades(self) -> None:
-        self.assertEqual(DASHBOARD_TABS, ["Market Signals", "Paper Bot & Trades"])
+    def test_dashboard_tabs_include_monitor_signals_and_trades(self) -> None:
+        self.assertEqual(DASHBOARD_TABS, ["Monitor", "Market Signals", "Paper Bot & Trades"])
 
 
 if __name__ == "__main__":

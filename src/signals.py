@@ -73,6 +73,60 @@ def bollinger_state(df: pd.DataFrame) -> str:
     return "normal"
 
 
+def macd_state(df: pd.DataFrame) -> str:
+    if "macd_hist" not in df or pd.isna(df["macd_hist"].iloc[-1]):
+        return "forming"
+    hist = float(df["macd_hist"].iloc[-1])
+    prev_hist = float(df["macd_hist"].iloc[-2]) if len(df) >= 2 else hist
+    if hist > 0 and hist >= prev_hist:
+        return "bullish expanding"
+    if hist > 0:
+        return "bullish fading"
+    if hist < 0 and hist <= prev_hist:
+        return "bearish expanding"
+    if hist < 0:
+        return "bearish fading"
+    return "flat"
+
+
+def adx_state(df: pd.DataFrame) -> tuple[float, str]:
+    if "adx" not in df or pd.isna(df["adx"].iloc[-1]):
+        return float("nan"), "forming"
+    adx = float(df["adx"].iloc[-1])
+    if adx >= 40:
+        return adx, "very strong trend"
+    if adx >= 25:
+        return adx, "trending"
+    if adx >= 20:
+        return adx, "weak trend"
+    return adx, "ranging"
+
+
+def vwap_state(df: pd.DataFrame) -> tuple[float, str]:
+    if "vwap_distance_pct" not in df or pd.isna(df["vwap_distance_pct"].iloc[-1]):
+        return float("nan"), "forming"
+    distance = float(df["vwap_distance_pct"].iloc[-1])
+    if distance >= 0.25:
+        return distance, "above VWAP"
+    if distance <= -0.25:
+        return distance, "below VWAP"
+    return distance, "at VWAP"
+
+
+def volatility_regime(df: pd.DataFrame, bollinger: str) -> str:
+    atr_pct = df["atr_percentile"].iloc[-1] if "atr_percentile" in df else np.nan
+    adx = df["adx"].iloc[-1] if "adx" in df else np.nan
+    if pd.isna(atr_pct) or pd.isna(adx):
+        return "forming"
+    if bollinger == "squeeze" or atr_pct <= 0.25:
+        return "compressed"
+    if adx >= 25 and atr_pct >= 0.5:
+        return "trending-expansion"
+    if atr_pct >= 0.8:
+        return "high-volatility"
+    return "normal"
+
+
 def _nearest_fib(price: float, fib: FibLevels) -> tuple[str, float, float]:
     candidates = {**fib.levels, **fib.extensions}
     name, level = min(candidates.items(), key=lambda item: abs(price - item[1]))
@@ -166,6 +220,10 @@ def analyze_timeframe(
     bb = bollinger_state(df)
     ema = ema_state(row)
     rsi = rsi_state(float(row["rsi"]))
+    macd = macd_state(df)
+    adx_value, adx_label = adx_state(df)
+    vwap_distance, vwap_label = vwap_state(df)
+    regime = volatility_regime(df, bb)
     elliott = elliott_wave_read(df, fib, pivots)
     alerts: list[Alert] = []
 
@@ -210,6 +268,12 @@ def analyze_timeframe(
             alerts.append(Alert("Watch", symbol, timeframe, "Open interest expansion", "Open interest is present and price volatility is elevated."))
             futures_score += 1
 
+    if adx_label in ("trending", "very strong trend"):
+        if macd.startswith("bullish") and ema.startswith("bullish"):
+            alerts.append(Alert("Signal", symbol, timeframe, "Trend-strength confirmation", f"ADX {adx_value:.0f} with bullish MACD."))
+        elif macd.startswith("bearish") and ema.startswith("bearish"):
+            alerts.append(Alert("Signal", symbol, timeframe, "Trend-strength confirmation", f"ADX {adx_value:.0f} with bearish MACD."))
+
     score = 0
     score += 2 if ema in ("bullish stack", "bearish stack") else 1 if "bias" in ema else 0
     score += 1 if rsi in ("bullish", "bearish") else 0
@@ -217,8 +281,10 @@ def analyze_timeframe(
     score += 1 if row["relative_volume"] >= 1.2 else 0
     score += 1 if nearest_fib_distance <= 0.015 else 0
     score += 1 if elliott["confidence"] == "medium" else 2 if elliott["confidence"] == "high" else 0
+    score += 1 if adx_label in ("trending", "very strong trend") else 0
+    score += 1 if macd in ("bullish expanding", "bearish expanding") else 0
     score += futures_score
-    confidence = "high" if score >= 6 else "medium" if score >= 4 else "low"
+    confidence = "high" if score >= 7 else "medium" if score >= 4 else "low"
 
     if ema.startswith("bullish") and rsi in ("bullish", "overbought") and bb != "lower expansion":
         scenario = "bullish continuation"
@@ -248,6 +314,13 @@ def analyze_timeframe(
         "elliott_state": elliott["state"],
         "elliott_confidence": elliott["confidence"],
         "elliott_detail": elliott["detail"],
+        "macd_state": macd,
+        "macd_hist": float(row["macd_hist"]) if "macd_hist" in df and not pd.isna(row["macd_hist"]) else np.nan,
+        "adx": adx_value,
+        "adx_state": adx_label,
+        "vwap_distance_pct": vwap_distance,
+        "vwap_state": vwap_label,
+        "volatility_regime": regime,
         "scenario": scenario,
         "confidence": confidence,
         "alerts": alerts,

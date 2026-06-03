@@ -60,6 +60,36 @@ class PaperTradingTest(unittest.TestCase):
         self.assertEqual(closed.iloc[0]["close_reason"], "target hit")
         self.assertGreater(float(closed.iloc[0]["realized_return_pct"]), 0)
 
+    def test_opens_and_closes_short_when_target_hit(self) -> None:
+        candidate = PaperTradeCandidate(
+            symbol="BTCUSDC",
+            action="paper_short",
+            confidence="high",
+            entry=100.0,
+            invalidation=105.0,
+            target_1=95.0,
+            target_2=90.0,
+            score=6,
+            reasons=[],
+            blockers=[],
+        )
+        opened = update_and_open_paper_trades(
+            pd.DataFrame(),
+            [candidate],
+            {"BTCUSDC": 100.0},
+            pd.Timestamp("2026-01-01T00:00:00Z"),
+        )
+        self.assertEqual(opened.iloc[0]["side"], "short")
+        closed = update_and_open_paper_trades(
+            opened,
+            [],
+            {"BTCUSDC": 94.0},
+            pd.Timestamp("2026-01-01T01:00:00Z"),
+        )
+        self.assertEqual(closed.iloc[0]["status"], "closed")
+        self.assertEqual(closed.iloc[0]["close_reason"], "target hit")
+        self.assertGreater(float(closed.iloc[0]["realized_return_pct"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

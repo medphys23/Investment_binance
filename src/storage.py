@@ -9,7 +9,11 @@ from typing import Any
 
 import pandas as pd
 
-from .config import PAPER_DB_PATH, PAPER_STARTING_EQUITY
+from .config import (
+    PAPER_DB_PATH,
+    PAPER_POLICY_BASE_THRESHOLD,
+    PAPER_STARTING_EQUITY,
+)
 
 
 SCHEMA = """
@@ -45,7 +49,16 @@ CREATE TABLE IF NOT EXISTS signal_features (
     elliott_confidence TEXT,
     scenario TEXT,
     confidence TEXT,
-    side TEXT
+    side TEXT,
+    macd_hist REAL,
+    adx REAL,
+    vwap_distance_pct REAL,
+    volatility_regime TEXT,
+    funding_rate REAL,
+    futures_spot_ratio REAL,
+    taker_buy_ratio REAL,
+    long_short_ratio REAL,
+    btc_corr REAL
 );
 
 CREATE TABLE IF NOT EXISTS paper_trades (
@@ -74,7 +87,25 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     score INTEGER,
     close_reason TEXT,
     reasons TEXT,
-    blockers TEXT
+    blockers TEXT,
+    p_win REAL,
+    policy_version INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS policy_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    updated_at TEXT NOT NULL,
+    policy_version INTEGER NOT NULL,
+    closed_trades INTEGER NOT NULL,
+    entry_prob_threshold REAL NOT NULL,
+    size_multiplier REAL NOT NULL,
+    batch_win_rate REAL,
+    batch_avg_return_pct REAL,
+    batch_profit_factor REAL,
+    batch_reward REAL,
+    long_win_rate REAL,
+    short_win_rate REAL,
+    note TEXT
 );
 
 CREATE TABLE IF NOT EXISTS model_runs (
@@ -107,8 +138,37 @@ def connect(db_path: str | Path = PAPER_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+_EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
+    "signal_features": {
+        "macd_hist": "REAL",
+        "adx": "REAL",
+        "vwap_distance_pct": "REAL",
+        "volatility_regime": "TEXT",
+        "funding_rate": "REAL",
+        "futures_spot_ratio": "REAL",
+        "taker_buy_ratio": "REAL",
+        "long_short_ratio": "REAL",
+        "btc_corr": "REAL",
+    },
+    "paper_trades": {
+        "p_win": "REAL",
+        "policy_version": "INTEGER",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table_name, columns in _EXPECTED_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        for column, column_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {column_type}")
+    conn.commit()
+
+
 def initialize_database(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
     now = pd.Timestamp.now(tz="UTC").isoformat()
     defaults = {
         "paper_equity": PAPER_STARTING_EQUITY,
@@ -118,6 +178,10 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         "worker_status": "not_started",
         "last_heartbeat": "",
         "last_cycle_error": "",
+        "entry_prob_threshold": PAPER_POLICY_BASE_THRESHOLD,
+        "size_multiplier": 1.0,
+        "policy_version": 0,
+        "dashboard_snapshot": {},
     }
     for key, value in defaults.items():
         conn.execute(
@@ -156,4 +220,9 @@ def table(conn: sqlite3.Connection, name: str, limit: int | None = None) -> pd.D
 
 def latest_model_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM model_runs ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def latest_policy_state(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM policy_state ORDER BY id DESC LIMIT 1").fetchone()
     return dict(row) if row else None

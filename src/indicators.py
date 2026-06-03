@@ -7,7 +7,21 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .config import ATR_PERIOD, BB_PERIOD, BB_STD, EMA_PERIODS, FIB_LOOKBACK, REL_VOLUME_PERIOD, RSI_PERIOD
+from .config import (
+    ADX_PERIOD,
+    ATR_PERIOD,
+    BB_PERIOD,
+    BB_STD,
+    EMA_PERIODS,
+    FIB_LOOKBACK,
+    MACD_FAST,
+    MACD_SIGNAL,
+    MACD_SLOW,
+    REL_VOLUME_PERIOD,
+    RSI_PERIOD,
+    VOLATILITY_RANK_WINDOW,
+    VWAP_PERIOD,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +56,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["rsi"] = 100 - (100 / (1 + rs))
     out["rsi"] = out["rsi"].fillna(50)
 
+    macd_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    macd_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+    out["macd"] = macd_fast - macd_slow
+    out["macd_signal"] = out["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    out["macd_hist"] = out["macd"] - out["macd_signal"]
+
     previous_close = close.shift(1)
     true_range = pd.concat(
         [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
@@ -49,6 +69,25 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ).max(axis=1)
     out["atr"] = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
     out["range_pct"] = (high - low) / close.replace(0, np.nan)
+    out["atr_percentile"] = out["atr"].rolling(VOLATILITY_RANK_WINDOW).rank(pct=True)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr_for_dm = true_range.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=out.index).ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_for_dm
+    minus_di = 100 * pd.Series(minus_dm, index=out.index).ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_for_dm
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    out["plus_di"] = plus_di
+    out["minus_di"] = minus_di
+    out["adx"] = dx.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
+
+    typical_price = (high + low + close) / 3
+    tp_volume = typical_price * out["volume"]
+    rolling_volume = out["volume"].rolling(VWAP_PERIOD).sum().replace(0, np.nan)
+    out["vwap"] = tp_volume.rolling(VWAP_PERIOD).sum() / rolling_volume
+    out["vwap_distance_pct"] = (close - out["vwap"]) / close.replace(0, np.nan) * 100
 
     out["volume_sma"] = out["volume"].rolling(REL_VOLUME_PERIOD).mean()
     out["relative_volume"] = out["volume"] / out["volume_sma"].replace(0, np.nan)

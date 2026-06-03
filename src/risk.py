@@ -22,10 +22,21 @@ def current_paper_equity(conn: sqlite3.Connection) -> float:
     return round(PAPER_STARTING_EQUITY + float(realized), 4)
 
 
-def position_size(entry: float, invalidation: float | None, equity: float) -> tuple[float, float, float]:
-    risk_amount = equity * PAPER_RISK_PER_TRADE
-    if invalidation is None or invalidation >= entry:
+def position_size(
+    entry: float,
+    invalidation: float | None,
+    equity: float,
+    side: str = "long",
+    size_multiplier: float = 1.0,
+) -> tuple[float, float, float]:
+    # size_multiplier (policy-driven) only scales DOWN within the risk ceiling;
+    # PAPER_RISK_PER_TRADE remains the hard cap on risk per trade.
+    multiplier = min(1.0, max(0.0, float(size_multiplier)))
+    risk_amount = equity * PAPER_RISK_PER_TRADE * multiplier
+    if invalidation is None:
         stop_distance = max(entry * 0.02, 0.00000001)
+    elif side == "short" or invalidation > entry:
+        stop_distance = max(invalidation - entry, 0.00000001)
     else:
         stop_distance = max(entry - invalidation, 0.00000001)
     quantity = risk_amount / stop_distance

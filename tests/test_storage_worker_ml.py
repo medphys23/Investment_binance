@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.config import KEY_TIMEFRAMES, SYMBOLS
+from src.indicators import fibonacci_levels
 from src.ml import train_batch_model
 from src.paper_worker import run_cycle
 from src.risk import position_size, update_equity_and_leverage_state
@@ -50,6 +51,21 @@ class FakeClient:
     def spot_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
         return frame(up=True).tail(limit)
 
+    def futures_24h(self, symbol: str) -> dict[str, str]:
+        return {"quoteVolume": "300000"}
+
+    def open_interest(self, symbol: str) -> dict[str, str]:
+        return {"openInterest": "1000"}
+
+    def mark_price(self, symbol: str) -> dict[str, str]:
+        return {"lastFundingRate": "0.0001", "markPrice": "150"}
+
+    def taker_buy_sell_volume(self, symbol: str, period: str, limit: int = 30) -> list[dict[str, str]]:
+        return [{"buySellRatio": "1.1"}]
+
+    def long_short_ratio(self, symbol: str, period: str, limit: int = 30) -> list[dict[str, str]]:
+        return [{"longShortRatio": "1.2"}]
+
 
 class StorageWorkerMlTest(unittest.TestCase):
     def test_sqlite_schema_creation(self) -> None:
@@ -75,22 +91,36 @@ class StorageWorkerMlTest(unittest.TestCase):
             self.assertTrue(get_state(conn, "last_heartbeat"))
             conn.close()
 
-    def test_bearish_candidate_does_not_open_short(self) -> None:
+    def test_bearish_candidate_becomes_paper_short(self) -> None:
+        fib = fibonacci_levels(frame(up=False))
         analyses = {
             timeframe: {
                 "ema_state": "bearish stack",
                 "rsi": 35.0,
                 "scenario": "bearish continuation",
+                "confidence": "high",
+                "relative_volume": 1.3,
+                "bollinger_state": "lower expansion",
                 "price": 100.0,
                 "atr": 2.0,
+                "fib": fib,
             }
             for timeframe in KEY_TIMEFRAMES
         }
         candidate = generate_paper_trade_candidate("BTCUSDC", analyses)
-        self.assertEqual(candidate.action, "risk_off")
+        self.assertEqual(candidate.action, "paper_short")
+        self.assertGreaterEqual(candidate.score, 3)
+        self.assertIsNotNone(candidate.invalidation)
+        self.assertGreater(candidate.invalidation, candidate.entry)
 
     def test_risk_sizing_uses_equity_and_invalidation_distance(self) -> None:
         quantity, notional, risk_amount = position_size(100.0, 95.0, 10_000.0)
+        self.assertEqual(risk_amount, 100.0)
+        self.assertEqual(quantity, 20.0)
+        self.assertEqual(notional, 2000.0)
+
+    def test_risk_sizing_for_short_uses_stop_above_entry(self) -> None:
+        quantity, notional, risk_amount = position_size(100.0, 105.0, 10_000.0, side="short")
         self.assertEqual(risk_amount, 100.0)
         self.assertEqual(quantity, 20.0)
         self.assertEqual(notional, 2000.0)

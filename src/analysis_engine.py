@@ -7,9 +7,9 @@ from typing import Any
 import pandas as pd
 
 from .binance_client import BinanceClient
-from .config import KEY_TIMEFRAMES, MATRIX_CANDLE_LIMIT, SYMBOLS
+from .config import DERIVATIVES_PERIOD, KEY_TIMEFRAMES, MATRIX_CANDLE_LIMIT, SYMBOLS
 from .indicators import add_indicators
-from .signals import analyze_timeframe, btc_risk_from_analysis
+from .signals import Alert, analyze_timeframe, btc_risk_from_analysis, summarize_alert_counts
 
 
 def to_float(value: Any) -> float | None:
@@ -29,6 +29,52 @@ def trend_side(analysis: dict[str, Any]) -> str:
     if ema.startswith("bearish") and rsi <= 50:
         return "bearish"
     return "mixed"
+
+
+def derivatives_context(client: BinanceClient, symbol: str) -> dict[str, Any]:
+    """Optional futures-derived context. Never raises: futures endpoints may be
+    region-restricted (451) and must not block the spot-only pipeline."""
+    spot_quote_volume = to_float((client.spot_24h(symbol) or {}).get("quoteVolume"))
+    futures_quote_volume = to_float((client.futures_24h(symbol) or {}).get("quoteVolume"))
+    ratio = (
+        futures_quote_volume / spot_quote_volume
+        if spot_quote_volume and futures_quote_volume
+        else None
+    )
+    open_interest = to_float((client.open_interest(symbol) or {}).get("openInterest"))
+    funding_rate = to_float((client.mark_price(symbol) or {}).get("lastFundingRate"))
+
+    taker = client.taker_buy_sell_volume(symbol, DERIVATIVES_PERIOD, limit=1)
+    taker_buy_ratio = to_float(taker[-1].get("buySellRatio")) if taker else None
+    ls = client.long_short_ratio(symbol, DERIVATIVES_PERIOD, limit=1)
+    long_short_ratio = to_float(ls[-1].get("longShortRatio")) if ls else None
+
+    return {
+        "spot_quote_volume": spot_quote_volume,
+        "futures_quote_volume": futures_quote_volume,
+        "futures_spot_ratio": ratio,
+        "open_interest": open_interest,
+        "open_interest_change": "expanding" if open_interest and ratio and ratio >= 2 else None,
+        "funding_rate": funding_rate,
+        "taker_buy_ratio": taker_buy_ratio,
+        "long_short_ratio": long_short_ratio,
+    }
+
+
+def correlation_with_btc(symbol_df: pd.DataFrame, btc_df: pd.DataFrame) -> float | None:
+    try:
+        length = min(len(symbol_df), len(btc_df))
+        if length < 20:
+            return None
+        sym = symbol_df["close"].tail(length).pct_change().dropna().reset_index(drop=True)
+        btc = btc_df["close"].tail(length).pct_change().dropna().reset_index(drop=True)
+        joined = pd.concat([sym, btc], axis=1).dropna()
+        if len(joined) < 20:
+            return None
+        value = float(joined.iloc[:, 0].corr(joined.iloc[:, 1]))
+        return None if pd.isna(value) else round(value, 4)
+    except Exception:
+        return None
 
 
 def market_snapshot(client: BinanceClient, symbol: str) -> dict[str, Any]:
@@ -119,3 +165,134 @@ def comparison_summary(analyses: dict[str, dict[str, Any]]) -> tuple[str, str, l
     if not notes:
         notes.append("Key timeframes are not showing a major contradiction.")
     return read, confidence, notes
+
+
+def _clean(value: Any) -> Any:
+    number = to_float(value)
+    if number is None:
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def gather_cycle_data(client: BinanceClient | None = None) -> dict[str, dict[str, Any]]:
+    """Single-pass computation of everything the worker needs per cycle.
+
+    Fetches BTC reference frames once, then per symbol computes key-timeframe
+    analyses, the live market snapshot, optional derivatives context, and the
+    BTC correlation. Heavy work runs here (in the worker), not in the UI.
+    """
+    client = client or BinanceClient()
+    btc_dfs = {tf: add_indicators(client.spot_klines("BTCUSDC", tf, MATRIX_CANDLE_LIMIT)) for tf in KEY_TIMEFRAMES}
+    btc_risk = {
+        tf: btc_risk_from_analysis(analyze_timeframe("BTCUSDC", tf, btc_dfs[tf], None)) for tf in KEY_TIMEFRAMES
+    }
+
+    data: dict[str, dict[str, Any]] = {}
+    for symbol in SYMBOLS:
+        analyses: dict[str, dict[str, Any]] = {}
+        dfs: dict[str, pd.DataFrame] = {}
+        for tf in KEY_TIMEFRAMES:
+            df = add_indicators(client.spot_klines(symbol, tf, MATRIX_CANDLE_LIMIT))
+            dfs[tf] = df
+            analyses[tf] = analyze_timeframe(
+                symbol,
+                tf,
+                df,
+                None,
+                btc_risk[tf] if symbol != "BTCUSDC" else None,
+            )
+        reference_tf = "12h" if "12h" in dfs else KEY_TIMEFRAMES[0]
+        data[symbol] = {
+            "analyses": analyses,
+            "snapshot": market_snapshot(client, symbol),
+            "derivatives": derivatives_context(client, symbol),
+            "btc_corr": correlation_with_btc(dfs[reference_tf], btc_dfs[reference_tf]),
+        }
+    return data
+
+
+def analysis_brief(analysis: dict[str, Any], side: str) -> dict[str, Any]:
+    counts = summarize_alert_counts(analysis.get("alerts", []))
+    return {
+        "scenario": analysis.get("scenario"),
+        "ema_state": analysis.get("ema_state"),
+        "rsi": _clean(analysis.get("rsi")),
+        "rsi_state": analysis.get("rsi_state"),
+        "bollinger_state": analysis.get("bollinger_state"),
+        "confidence": analysis.get("confidence"),
+        "relative_volume": _clean(analysis.get("relative_volume")),
+        "market_structure": analysis.get("market_structure"),
+        "nearest_fib": analysis.get("nearest_fib"),
+        "fib_distance_pct": _clean(analysis.get("fib_distance_pct")),
+        "elliott_state": analysis.get("elliott_state"),
+        "elliott_confidence": analysis.get("elliott_confidence"),
+        "macd_state": analysis.get("macd_state"),
+        "adx": _clean(analysis.get("adx")),
+        "adx_state": analysis.get("adx_state"),
+        "vwap_state": analysis.get("vwap_state"),
+        "vwap_distance_pct": _clean(analysis.get("vwap_distance_pct")),
+        "volatility_regime": analysis.get("volatility_regime"),
+        "side": side,
+        "alerts_total": len(analysis.get("alerts", [])),
+        "watch": counts["Watch"],
+        "signal": counts["Signal"],
+        "risk": counts["Risk"],
+    }
+
+
+def build_dashboard_snapshot(
+    now: pd.Timestamp,
+    data: dict[str, dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a JSON-safe snapshot the dashboard can render without recomputation."""
+    symbols_payload: dict[str, Any] = {}
+    alerts_payload: list[dict[str, Any]] = []
+
+    for symbol, bundle in data.items():
+        analyses = bundle["analyses"]
+        snapshot = bundle["snapshot"]
+        derivatives = bundle["derivatives"]
+        sides = {tf: trend_side(analyses[tf]) for tf in analyses}
+        read, confidence, notes = comparison_summary(analyses)
+        timeframes = {tf: analysis_brief(analyses[tf], sides[tf]) for tf in analyses}
+        for tf, analysis in analyses.items():
+            for alert in analysis.get("alerts", []):
+                alerts_payload.append(
+                    {
+                        "severity": alert.severity,
+                        "symbol": alert.symbol,
+                        "timeframe": alert.timeframe,
+                        "title": alert.title,
+                        "detail": alert.detail,
+                    }
+                )
+        symbols_payload[symbol] = {
+            "price": _clean(snapshot.get("price")),
+            "price_change_pct": _clean(snapshot.get("price_change_pct")),
+            "spot_quote_volume": _clean(snapshot.get("quote_volume")),
+            "spread_pct": _clean(snapshot.get("spread_pct")),
+            "futures_quote_volume": _clean(derivatives.get("futures_quote_volume")),
+            "futures_spot_ratio": _clean(derivatives.get("futures_spot_ratio")),
+            "funding_rate": _clean(derivatives.get("funding_rate")),
+            "taker_buy_ratio": _clean(derivatives.get("taker_buy_ratio")),
+            "long_short_ratio": _clean(derivatives.get("long_short_ratio")),
+            "open_interest": _clean(derivatives.get("open_interest")),
+            "btc_corr": _clean(bundle.get("btc_corr")),
+            "timeframes": timeframes,
+            "comparison": {"read": read, "confidence": confidence, "notes": notes},
+            "side_counts": {
+                "bullish": sum(1 for s in sides.values() if s == "bullish"),
+                "bearish": sum(1 for s in sides.values() if s == "bearish"),
+                "mixed": sum(1 for s in sides.values() if s == "mixed"),
+            },
+        }
+
+    return {
+        "generated_at": now.isoformat(),
+        "symbols": symbols_payload,
+        "alerts": alerts_payload,
+        "candidates": candidate_rows,
+    }

@@ -9,9 +9,13 @@ This repo inherits global Cursor/Codex rules from `~/.cursor/rules/` and `~/.cod
 - Purpose: local read-only Binance technical signal dashboard.
 - Never add authenticated exchange access, API keys, real trading execution, order management, withdrawals, or automated exchange trading.
 - Local paper-trade tracking is allowed only when it uses live Binance public market prices, not synthetic market data or manual trade uploads.
-- Paper trades are spot-style long simulations only. Bearish setups are `risk_off` / `avoid`, never shorts.
+- Paper trades may simulate long (`paper_long`) and short (`paper_short`) positions from live public prices only; no real execution.
 - Keep the always-on worker and dashboard sharing SQLite at `data/paper_bot.sqlite`.
 - Simulated leverage is research-only and capped at `10x`.
+- ML is a reinforcement-style batch policy: retrain every `200` closed trades (cold-start pass-through before `50`), time-ordered split + calibration, reward-driven advisory entry-probability threshold and size multiplier; the multiplier only scales size down within the `1%` risk ceiling and never overrides the leverage cap. Never present it as a guarantee.
+- Heavy analysis runs in the worker (`gather_cycle_data` + `build_dashboard_snapshot` in `src/analysis_engine.py`) and is persisted to SQLite; the dashboard reads the `dashboard_snapshot` and recomputes only the single selected chart live.
+- Persisted additions: extra `signal_features` columns (MACD/ADX/VWAP/volatility regime/derivatives/BTC correlation), `paper_trades.p_win`/`policy_version`, and a `policy_state` table; use the `ALTER TABLE` migration in `src/storage.py` for new columns. Cache the trained model at `data/policy_model.pkl` (gitignored).
+- Mobile/PWA: keep the `Monitor` tab, manifest/meta injection in `app.py`, and theme in `.streamlit/config.toml`. Deployment/hosting for remote phone access is a later decision.
 - Keep predictions scenario-based with confidence, confluence, invalidation, and likely zones only.
 - Treat Elliott Wave detection as probabilistic.
 - Preserve `6h`, `8h`, and `12h` as first-class regime filters.

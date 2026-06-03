@@ -47,8 +47,16 @@ def _risk_levels(action: str, analysis: dict[str, Any]) -> tuple[float | None, f
     elif action == "paper_short":
         nearby_resistances = [level for level in fib.levels.values() if level > price]
         invalidation = min(nearby_resistances) if nearby_resistances else price + 1.5 * atr
-        target_1 = max(level for level in fib.extensions.values()) if fib.extensions else price - 1.5 * atr
-        target_2 = min(level for level in fib.extensions.values()) if fib.extensions else price - 2.5 * atr
+        below_price = sorted(
+            {level for level in {**fib.levels, **fib.extensions}.values() if level < price},
+            reverse=True,
+        )
+        if len(below_price) >= 2:
+            target_1, target_2 = below_price[0], below_price[-1]
+        elif len(below_price) == 1:
+            target_1, target_2 = below_price[0], price - 2.5 * atr
+        else:
+            target_1, target_2 = price - 1.5 * atr, price - 2.5 * atr
     return invalidation, target_1, target_2
 
 
@@ -72,17 +80,17 @@ def generate_paper_trade_candidate(symbol: str, analyses: dict[str, dict[str, An
         score += 3
         reasons.append("at least four key timeframes lean bullish")
     elif bearish >= 4:
-        action = "risk_off"
-        score += 1
-        blockers.append("bearish agreement detected; spot-only bot avoids opening shorts")
+        action = "paper_short"
+        score += 3
+        reasons.append("at least four key timeframes lean bearish")
     elif bullish >= 3 and sides.get("12h") == "bullish":
         action = "paper_long"
         score += 2
         reasons.append("12h regime and majority of key timeframes lean bullish")
     elif bearish >= 3 and sides.get("12h") == "bearish":
-        action = "risk_off"
-        score += 1
-        blockers.append("12h bearish regime detected; spot-only bot avoids opening shorts")
+        action = "paper_short"
+        score += 2
+        reasons.append("12h regime and majority of key timeframes lean bearish")
     else:
         action = "observe"
         blockers.append("key timeframes do not have enough directional agreement")
@@ -109,7 +117,7 @@ def generate_paper_trade_candidate(symbol: str, analyses: dict[str, dict[str, An
         if "mean-reversion" in analysis.get("scenario", ""):
             blockers.append(f"{timeframe} flags mean-reversion risk")
 
-    if action == "paper_long" and score < 3:
+    if action in {"paper_long", "paper_short"} and score < 3:
         action = "observe"
         blockers.append("confluence score is too low for a paper candidate")
 

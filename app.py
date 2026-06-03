@@ -10,14 +10,57 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from src.binance_client import BinanceClient, BinanceClientError
-from src.config import DASHBOARD_TABS, DEFAULT_CANDLE_LIMIT, KEY_TIMEFRAMES, MATRIX_CANDLE_LIMIT, SYMBOLS, TIMEFRAMES
+from src.config import (
+    DASHBOARD_TABS,
+    DEFAULT_CANDLE_LIMIT,
+    KEY_TIMEFRAMES,
+    MATRIX_CANDLE_LIMIT,
+    PAPER_POLICY_BATCH,
+    SYMBOLS,
+    TIMEFRAMES,
+)
 from src.indicators import add_indicators
 from src.signals import Alert, analyze_timeframe, btc_risk_from_analysis, summarize_alert_counts
-from src.storage import connect, get_state, initialize_database, latest_model_run, table
-from src.strategy import candidate_to_row, generate_paper_trade_candidate
+from src.storage import connect, get_state, initialize_database, latest_model_run, latest_policy_state, table
 
 
-st.set_page_config(page_title="Binance Technical Signal Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Crypto Paper Bot Monitor",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+def inject_pwa() -> None:
+    """Make the dashboard installable to a phone home screen (Add to Home Screen).
+
+    Uses an inline data-URI manifest so no external hosting is required; the
+    deployment target (tunnel/cloud) can be decided later without code changes.
+    """
+    manifest = {
+        "name": "Crypto Paper Bot Monitor",
+        "short_name": "PaperBot",
+        "display": "standalone",
+        "background_color": "#0e1117",
+        "theme_color": "#0e1117",
+        "start_url": ".",
+        "icons": [],
+    }
+    manifest_uri = "data:application/manifest+json," + json.dumps(manifest)
+    st.markdown(
+        f"""
+        <link rel="manifest" href="{manifest_uri}">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        <meta name="apple-mobile-web-app-title" content="PaperBot">
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+inject_pwa()
 
 
 @st.cache_data(ttl=45, show_spinner=False)
@@ -378,29 +421,8 @@ def render_bnb_relationship(selected_timeframe: str) -> None:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
-def render_paper_bot() -> None:
-    st.subheader("Paper Bot & Trades")
-    st.caption("Local paper simulation only. Uses live Binance public spot prices; no account access, API keys, real orders, futures execution, or real leverage.")
-
-    refresh_col, hint_col = st.columns([1, 4])
-    if refresh_col.button("Refresh now", key="paper_bot_refresh", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-    hint_col.caption("Click Refresh now to reload worker status, trades, and candidates from SQLite and Binance.")
-
-    refreshed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    st.caption(f"Panel loaded at {refreshed_at}")
-
-    candidates = []
-    for symbol in SYMBOLS:
-        analyses = build_key_timeframe_analyses(symbol)
-        candidate = generate_paper_trade_candidate(symbol, analyses)
-        candidates.append(candidate)
-
-    candidate_rows = pd.DataFrame([candidate_to_row(candidate) for candidate in candidates])
-    st.write("**Current paper candidates**")
-    st.dataframe(candidate_rows, use_container_width=True, hide_index=True)
-
+@st.cache_data(ttl=20, show_spinner=False)
+def load_bot_state() -> dict[str, Any]:
     conn = connect()
     initialize_database(conn)
     state = {
@@ -410,53 +432,440 @@ def render_paper_bot() -> None:
         "paper_equity": get_state(conn, "paper_equity", 10000.0),
         "drawdown_pct": get_state(conn, "drawdown_pct", 0.0),
         "simulated_leverage": get_state(conn, "simulated_leverage", 1.0),
+        "entry_prob_threshold": get_state(conn, "entry_prob_threshold", 0.5),
+        "size_multiplier": get_state(conn, "size_multiplier", 1.0),
+        "policy_version": get_state(conn, "policy_version", 0),
+        "snapshot": get_state(conn, "dashboard_snapshot", {}) or {},
     }
-    trades = table(conn, "paper_trades")
-    model = latest_model_run(conn)
     conn.close()
-    active = trades[trades["status"].eq("open")]
-    closed = trades[trades["status"].eq("closed")]
-    avg_realized = closed["realized_return_pct"].dropna().astype(float).mean() if not closed.empty else None
-    win_rate = (closed["realized_return_pct"].dropna().astype(float) > 0).mean() * 100 if not closed.empty else None
+    return state
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Worker", state["worker_status"])
-    col2.metric("Paper equity", f"{float(state['paper_equity']):,.2f} USDC")
-    col3.metric("Drawdown", f"{float(state['drawdown_pct']):.2f}%")
-    col4.metric("Sim leverage tier", f"{float(state['simulated_leverage']):.1f}x")
-    st.write(f"**Last worker heartbeat:** {state['last_heartbeat'] or 'not started'}")
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_tables() -> dict[str, pd.DataFrame | dict | None]:
+    conn = connect()
+    initialize_database(conn)
+    trades = table(conn, "paper_trades")
+    policy_history = pd.read_sql_query("SELECT * FROM policy_state ORDER BY id ASC", conn)
+    model = latest_model_run(conn)
+    policy = latest_policy_state(conn)
+    conn.close()
+    return {"trades": trades, "policy_history": policy_history, "model": model, "policy": policy}
+
+
+def _heartbeat_age(last_heartbeat: str) -> str:
+    if not last_heartbeat:
+        return "never"
+    try:
+        ts = pd.Timestamp(last_heartbeat)
+        delta = pd.Timestamp.now(tz="UTC") - ts
+        minutes = int(delta.total_seconds() // 60)
+        if minutes < 1:
+            return "just now"
+        if minutes < 60:
+            return f"{minutes} min ago"
+        return f"{minutes // 60}h {minutes % 60}m ago"
+    except Exception:
+        return last_heartbeat
+
+
+def _closed_with_pnl(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return trades
+    closed = trades[trades["status"].eq("closed")].copy()
+    if closed.empty:
+        return closed
+    closed["closed_at"] = pd.to_datetime(closed["closed_at"], errors="coerce", utc=True)
+    closed = closed.sort_values("closed_at")
+    closed["realized_pnl"] = pd.to_numeric(closed["realized_pnl"], errors="coerce").fillna(0.0)
+    closed["realized_return_pct"] = pd.to_numeric(closed["realized_return_pct"], errors="coerce")
+    return closed
+
+
+def equity_curve_fig(closed: pd.DataFrame, starting_equity: float) -> go.Figure:
+    equity = starting_equity + closed["realized_pnl"].cumsum()
+    fig = go.Figure(go.Scatter(x=closed["closed_at"], y=equity, mode="lines", line={"color": "#2ca02c", "width": 2}))
+    fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10}, yaxis_title="Equity (USDC)")
+    return fig
+
+
+def drawdown_fig(closed: pd.DataFrame, starting_equity: float) -> go.Figure:
+    equity = starting_equity + closed["realized_pnl"].cumsum()
+    peak = equity.cummax()
+    drawdown = (equity - peak) / peak * 100
+    fig = go.Figure(go.Scatter(x=closed["closed_at"], y=drawdown, fill="tozeroy", line={"color": "#d62728"}))
+    fig.update_layout(height=200, margin={"l": 10, "r": 10, "t": 10, "b": 10}, yaxis_title="Drawdown %")
+    return fig
+
+
+def pnl_hist_fig(closed: pd.DataFrame) -> go.Figure:
+    returns = closed["realized_return_pct"].dropna()
+    fig = go.Figure(go.Histogram(x=returns, nbinsx=30, marker_color="#1f77b4"))
+    fig.update_layout(height=220, margin={"l": 10, "r": 10, "t": 10, "b": 10}, xaxis_title="Realized return %", yaxis_title="Trades")
+    return fig
+
+
+def winrate_over_time_fig(closed: pd.DataFrame, window: int = 20) -> go.Figure:
+    wins = (closed["realized_return_pct"] > 0).astype(float)
+    rolling = wins.rolling(window, min_periods=max(3, window // 4)).mean() * 100
+    fig = go.Figure(go.Scatter(x=closed["closed_at"], y=rolling, mode="lines", line={"color": "#9467bd"}))
+    fig.add_hline(y=50, line_dash="dot", line_color="#777")
+    fig.update_layout(height=220, margin={"l": 10, "r": 10, "t": 10, "b": 10}, yaxis_title=f"Rolling win % ({window})")
+    return fig
+
+
+def long_short_fig(closed: pd.DataFrame) -> go.Figure:
+    grouped = closed.groupby("side")["realized_return_pct"].mean()
+    fig = go.Figure(
+        go.Bar(
+            x=list(grouped.index),
+            y=list(grouped.values),
+            marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in grouped.values],
+        )
+    )
+    fig.update_layout(height=220, margin={"l": 10, "r": 10, "t": 10, "b": 10}, yaxis_title="Avg return % by side")
+    return fig
+
+
+def reward_per_batch_fig(policy_history: pd.DataFrame) -> go.Figure:
+    fig = go.Figure(
+        go.Scatter(
+            x=policy_history["policy_version"],
+            y=pd.to_numeric(policy_history["batch_reward"], errors="coerce"),
+            mode="lines+markers",
+            line={"color": "#ff7f0e"},
+        )
+    )
+    fig.update_layout(height=220, margin={"l": 10, "r": 10, "t": 10, "b": 10}, xaxis_title="Policy version", yaxis_title="Batch reward (PnL)")
+    return fig
+
+
+def calibration_fig(closed: pd.DataFrame) -> go.Figure | None:
+    subset = closed.dropna(subset=["p_win"]).copy()
+    subset["p_win"] = pd.to_numeric(subset["p_win"], errors="coerce")
+    subset = subset.dropna(subset=["p_win"])
+    if len(subset) < 10:
+        return None
+    subset["bucket"] = (subset["p_win"] * 5).round() / 5
+    grouped = subset.groupby("bucket").agg(
+        predicted=("p_win", "mean"),
+        actual=("realized_return_pct", lambda s: float((s > 0).mean())),
+    )
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line={"dash": "dot", "color": "#777"}, name="Ideal"))
+    fig.add_trace(go.Scatter(x=grouped["predicted"], y=grouped["actual"], mode="markers+lines", marker={"color": "#1f77b4"}, name="Observed"))
+    fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10}, xaxis_title="Predicted win prob", yaxis_title="Actual win rate")
+    return fig
+
+
+def feature_importance_fig(model: dict | None) -> go.Figure | None:
+    if not model or not model.get("top_features"):
+        return None
+    features = pd.DataFrame(json.loads(model["top_features"] or "[]"))
+    if features.empty:
+        return None
+    features = features.sort_values("importance")
+    fig = go.Figure(go.Bar(x=features["importance"], y=features["feature"], orientation="h", marker_color="#17becf"))
+    fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 10, "b": 10}, xaxis_title="Importance")
+    return fig
+
+
+def pwin_gauge_fig(p_win: float, threshold: float) -> go.Figure:
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=round(p_win * 100, 1),
+            number={"suffix": "%"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#2ca02c" if p_win >= threshold else "#d62728"},
+                "threshold": {"line": {"color": "#fff", "width": 3}, "value": threshold * 100},
+            },
+        )
+    )
+    fig.update_layout(height=180, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+    return fig
+
+
+def timeframe_heatmap_fig(snapshot: dict[str, Any]) -> go.Figure | None:
+    symbols = snapshot.get("symbols", {})
+    if not symbols:
+        return None
+    side_value = {"bullish": 1, "mixed": 0, "bearish": -1}
+    coins = [s.removesuffix("USDC") for s in symbols]
+    z, text = [], []
+    for sym in symbols:
+        tfs = symbols[sym].get("timeframes", {})
+        row_z, row_t = [], []
+        for tf in KEY_TIMEFRAMES:
+            brief = tfs.get(tf, {})
+            side = brief.get("side", "mixed")
+            row_z.append(side_value.get(side, 0))
+            row_t.append(f"{side}<br>{brief.get('scenario', '')}")
+        z.append(row_z)
+        text.append(row_t)
+    fig = go.Figure(
+        go.Heatmap(
+            z=z,
+            x=KEY_TIMEFRAMES,
+            y=coins,
+            text=text,
+            texttemplate="%{text}",
+            colorscale=[[0, "#d62728"], [0.5, "#444"], [1, "#2ca02c"]],
+            zmid=0,
+            showscale=False,
+        )
+    )
+    fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+    return fig
+
+
+def render_kpis(state: dict[str, Any], trades: pd.DataFrame, policy: dict | None) -> None:
+    closed = trades[trades["status"].eq("closed")] if not trades.empty else trades
+    open_trades = trades[trades["status"].eq("open")] if not trades.empty else trades
+    win_rate = (
+        (pd.to_numeric(closed["realized_return_pct"], errors="coerce") > 0).mean() * 100 if not closed.empty else None
+    )
+    status = state["worker_status"]
+    status_icon = "🟢" if status == "ok" else "🔴" if status == "error" else "⚪"
+
+    row1 = st.columns(3)
+    row1[0].metric("Worker", f"{status_icon} {status}", _heartbeat_age(state["last_heartbeat"]))
+    row1[1].metric("Paper equity", f"{float(state['paper_equity']):,.0f}", f"DD {float(state['drawdown_pct']):.1f}%")
+    row1[2].metric("Open / Closed", f"{len(open_trades)} / {len(closed)}")
+
+    row2 = st.columns(3)
+    row2[0].metric("Win rate", "-" if win_rate is None else f"{win_rate:.0f}%")
+    row2[1].metric("Sim leverage", f"{float(state['simulated_leverage']):.1f}x")
+    row2[2].metric("Policy v", f"{state['policy_version']}", f"thr {float(state['entry_prob_threshold']):.2f}")
     if state["last_cycle_error"]:
         st.error(f"Last worker error: {state['last_cycle_error']}")
 
-    metric_a, metric_b, metric_c, metric_d = st.columns(4)
-    metric_a.metric("Open paper trades", len(active))
-    metric_b.metric("Closed paper trades", len(closed))
-    metric_c.metric("Win rate", "-" if win_rate is None else f"{win_rate:.2f}%")
-    metric_d.metric("Average return", "-" if avg_realized is None else f"{avg_realized:.2f}%")
+
+def render_monitor() -> None:
+    st.subheader("Live Monitor")
+    st.caption("Phone-friendly snapshot of the always-on paper bot. Simulated long/short research only - not financial advice.")
+    if st.button("Refresh", key="monitor_refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    state = load_bot_state()
+    tables = load_tables()
+    trades = tables["trades"]
+    snapshot = state["snapshot"]
+
+    render_kpis(state, trades, tables["policy"])
+
+    if snapshot:
+        st.caption(f"Market snapshot generated {snapshot.get('generated_at', 'n/a')}")
+        heatmap = timeframe_heatmap_fig(snapshot)
+        if heatmap is not None:
+            st.write("**Timeframe bias (green=bullish, red=bearish)**")
+            st.plotly_chart(heatmap, use_container_width=True, config={"displayModeBar": False}, key="monitor_heatmap")
+
+        candidates = pd.DataFrame(snapshot.get("candidates", []))
+        if not candidates.empty:
+            st.write("**Current candidates**")
+            st.dataframe(candidates[["Symbol", "Action", "Confidence", "Score"]], use_container_width=True, hide_index=True)
+    else:
+        st.info("No worker snapshot yet. Start the worker: `python -m src.paper_worker`.")
+
+    closed = _closed_with_pnl(trades)
+    if not closed.empty:
+        st.write("**Equity curve**")
+        st.plotly_chart(equity_curve_fig(closed, float(state["paper_equity"]) - closed["realized_pnl"].sum()), use_container_width=True, config={"displayModeBar": False}, key="monitor_equity_curve")
+
+
+def render_paper_bot() -> None:
+    st.subheader("Paper Bot & Trades")
+    st.caption(
+        "Local paper simulation only (simulated long and short). Uses live Binance public spot prices; "
+        "no account access, API keys, real orders, futures execution, or real leverage."
+    )
+
+    if st.button("Refresh now", key="paper_bot_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption(f"Panel loaded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+    state = load_bot_state()
+    tables = load_tables()
+    trades = tables["trades"]
+    model = tables["model"]
+    policy = tables["policy"]
+    snapshot = state["snapshot"]
+
+    render_kpis(state, trades, policy)
+
+    candidate_rows = pd.DataFrame(snapshot.get("candidates", [])) if snapshot else pd.DataFrame()
+    st.write("**Current paper candidates**")
+    if candidate_rows.empty:
+        st.info("No candidates yet. Start the worker to populate this from live market data.")
+    else:
+        st.dataframe(candidate_rows, use_container_width=True, hide_index=True)
+        threshold = float(state["entry_prob_threshold"])
+        tradable = candidate_rows[candidate_rows.get("Action", "").isin(["paper_long", "paper_short"])] if "Action" in candidate_rows else pd.DataFrame()
+        gauges = [r for _, r in tradable.iterrows() if r.get("p_win") is not None]
+        if gauges:
+            st.caption("Advisory ML win probability (white line = current entry threshold)")
+            gauge_cols = st.columns(min(len(gauges), 3))
+            for idx, row in enumerate(gauges[:3]):
+                with gauge_cols[idx]:
+                    st.caption(f"{row['Symbol']} {row['Action']}")
+                    st.plotly_chart(pwin_gauge_fig(float(row["p_win"]), threshold), use_container_width=True, config={"displayModeBar": False}, key=f"pwin_gauge_{row['Symbol']}_{row['Action']}_{idx}")
+
+    active = trades[trades["status"].eq("open")] if not trades.empty else trades
+    closed = _closed_with_pnl(trades)
 
     st.write("**Open paper trades**")
     st.dataframe(active, use_container_width=True, hide_index=True)
     st.write("**Closed paper trades**")
     st.dataframe(closed.tail(50), use_container_width=True, hide_index=True)
 
+    if not closed.empty:
+        st.write("**Performance**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Equity curve")
+            st.plotly_chart(equity_curve_fig(closed, float(state["paper_equity"]) - closed["realized_pnl"].sum()), use_container_width=True, config={"displayModeBar": False}, key="paper_equity_curve")
+            st.caption("Return distribution")
+            st.plotly_chart(pnl_hist_fig(closed), use_container_width=True, config={"displayModeBar": False}, key="paper_pnl_hist")
+        with c2:
+            st.caption("Drawdown")
+            st.plotly_chart(drawdown_fig(closed, float(state["paper_equity"]) - closed["realized_pnl"].sum()), use_container_width=True, config={"displayModeBar": False}, key="paper_drawdown")
+            st.caption("Rolling win rate")
+            st.plotly_chart(winrate_over_time_fig(closed), use_container_width=True, config={"displayModeBar": False}, key="paper_winrate")
+        if closed["side"].nunique() > 1:
+            st.caption("Average return by side (long vs short)")
+            st.plotly_chart(long_short_fig(closed), use_container_width=True, config={"displayModeBar": False}, key="paper_long_short")
+
+    st.write("**Reinforcement-style policy**")
+    st.caption(
+        f"The bot retrains on its experience every {PAPER_POLICY_BATCH} closed trades and adjusts an advisory "
+        "entry-probability threshold and a size multiplier (capped at the risk ceiling) for the next batch."
+    )
+    if policy:
+        pc = st.columns(4)
+        pc[0].metric("Entry threshold", f"{float(policy['entry_prob_threshold']):.2f}")
+        pc[1].metric("Size multiplier", f"{float(policy['size_multiplier']):.2f}x")
+        pc[2].metric("Batch win rate", "-" if policy.get("batch_win_rate") is None else f"{float(policy['batch_win_rate']):.0f}%")
+        pc[3].metric("Batch reward", "-" if policy.get("batch_reward") is None else f"{float(policy['batch_reward']):.1f}")
+        if policy.get("note"):
+            st.caption(f"Status: {policy['note']}")
+    policy_history = tables["policy_history"]
+    if isinstance(policy_history, pd.DataFrame) and policy_history["batch_reward"].notna().any():
+        st.caption("Reward per learning batch")
+        st.plotly_chart(reward_per_batch_fig(policy_history), use_container_width=True, config={"displayModeBar": False}, key="paper_reward_batch")
+
+    calib = calibration_fig(closed) if not closed.empty else None
+    if calib is not None:
+        st.caption("Model calibration (predicted vs actual win rate)")
+        st.plotly_chart(calib, use_container_width=True, config={"displayModeBar": False}, key="paper_calibration")
+
     st.write("**ML learning status**")
     if model is None:
         st.info("No model run yet. Start the paper worker to begin collecting closed paper-trade outcomes.")
+    elif model.get("skipped_reason"):
+        st.warning(f"Model status: {model['skipped_reason']} ({model['sample_count']} closed trades).")
     else:
-        if model.get("skipped_reason"):
-            st.warning(f"Model skipped: {model['skipped_reason']} ({model['sample_count']} closed trades).")
+        ml_cols = st.columns(4)
+        ml_cols[0].metric("Samples", model["sample_count"])
+        ml_cols[1].metric("Accuracy", f"{float(model['accuracy']):.2f}")
+        ml_cols[2].metric("Precision", f"{float(model['precision']):.2f}")
+        ml_cols[3].metric("Recall", f"{float(model['recall']):.2f}")
+        importance = feature_importance_fig(model)
+        if importance is not None:
+            st.plotly_chart(importance, use_container_width=True, config={"displayModeBar": False}, key="paper_feature_importance")
+
+
+def render_alert_dicts(alerts: list[dict[str, Any]]) -> None:
+    severity_order = {"Risk": 0, "Signal": 1, "Watch": 2}
+    ordered = sorted(alerts, key=lambda a: (severity_order.get(a.get("severity"), 9), a.get("symbol"), a.get("timeframe")))
+    for alert in ordered[:25]:
+        line = f"{alert.get('symbol')} {alert.get('timeframe')}: {alert.get('title')} - {alert.get('detail')}"
+        if alert.get("severity") == "Risk":
+            st.error(line)
+        elif alert.get("severity") == "Signal":
+            st.success(line)
         else:
-            ml_cols = st.columns(4)
-            ml_cols[0].metric("Samples", model["sample_count"])
-            ml_cols[1].metric("Accuracy", f"{float(model['accuracy']):.2f}")
-            ml_cols[2].metric("Precision", f"{float(model['precision']):.2f}")
-            ml_cols[3].metric("Recall", f"{float(model['recall']):.2f}")
-            top_features = pd.DataFrame(json.loads(model["top_features"] or "[]"))
-            st.dataframe(top_features, use_container_width=True, hide_index=True)
+            st.info(line)
 
 
-st.title("Binance Technical Signal Dashboard")
-st.caption("Read-only market analysis. No account access, no trade execution, and no financial advice.")
+def snapshot_watchlist(snapshot: dict[str, Any], timeframe: str) -> pd.DataFrame:
+    rows = []
+    for symbol, payload in snapshot.get("symbols", {}).items():
+        brief = payload.get("timeframes", {}).get(timeframe, {})
+        rows.append(
+            {
+                "Symbol": symbol,
+                "Price": payload.get("price"),
+                "24h %": payload.get("price_change_pct"),
+                "Spot vol": _format_money(payload.get("spot_quote_volume")),
+                "Fut/spot": payload.get("futures_spot_ratio"),
+                "Funding": payload.get("funding_rate"),
+                "BTC corr": payload.get("btc_corr"),
+                "RSI": brief.get("rsi"),
+                "Trend": brief.get("ema_state"),
+                "ADX": brief.get("adx"),
+                "MACD": brief.get("macd_state"),
+                "Regime": brief.get("volatility_regime"),
+                "Scenario": brief.get("scenario"),
+                "Confidence": brief.get("confidence"),
+                "Alerts": brief.get("alerts_total"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def snapshot_matrix(snapshot: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for symbol, payload in snapshot.get("symbols", {}).items():
+        row: dict[str, Any] = {"Coin": _base_asset(symbol)}
+        for timeframe in KEY_TIMEFRAMES:
+            brief = payload.get("timeframes", {}).get(timeframe, {})
+            rsi = brief.get("rsi")
+            rsi_text = f"{rsi:.0f}" if isinstance(rsi, (int, float)) else "-"
+            row[timeframe] = (
+                f"{brief.get('scenario', '-')} | {brief.get('ema_state', '-')} | "
+                f"RSI {rsi_text} | {brief.get('bollinger_state', '-')} | {brief.get('confidence', '-')}"
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def snapshot_comparison(snapshot: dict[str, Any], symbol: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    payload = snapshot.get("symbols", {}).get(symbol, {})
+    rows = []
+    for timeframe in KEY_TIMEFRAMES:
+        brief = payload.get("timeframes", {}).get(timeframe, {})
+        rows.append(
+            {
+                "Timeframe": timeframe,
+                "Scenario": brief.get("scenario"),
+                "Confidence": brief.get("confidence"),
+                "Trend": brief.get("ema_state"),
+                "RSI": brief.get("rsi"),
+                "MACD": brief.get("macd_state"),
+                "ADX": brief.get("adx"),
+                "Bollinger": brief.get("bollinger_state"),
+                "Regime": brief.get("volatility_regime"),
+                "Structure": brief.get("market_structure"),
+                "Elliott": f"{brief.get('elliott_state')} ({brief.get('elliott_confidence')})",
+                "Side": brief.get("side"),
+            }
+        )
+    return pd.DataFrame(rows), payload.get("comparison", {})
+
+
+def snapshot_alerts(snapshot: dict[str, Any], timeframe: str | None = None) -> list[dict[str, Any]]:
+    alerts = snapshot.get("alerts", [])
+    if timeframe is None:
+        return alerts
+    return [a for a in alerts if a.get("timeframe") == timeframe]
+
+
+st.title("Crypto Paper Bot Monitor")
+st.caption("Read-only market analysis and simulated paper trading. No account access, no real execution, no financial advice.")
 
 with st.sidebar:
     selected_symbol = st.selectbox("Symbol", SYMBOLS, index=0)
@@ -467,13 +876,25 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-market_tab, paper_tab = st.tabs(DASHBOARD_TABS)
+monitor_tab, market_tab, paper_tab = st.tabs(DASHBOARD_TABS)
+
+with monitor_tab:
+    try:
+        render_monitor()
+    except Exception as exc:
+        st.exception(exc)
 
 with market_tab:
     try:
-        watchlist, alerts, watchlist_analyses = build_watchlist(matrix_timeframe)
+        snapshot = load_bot_state()["snapshot"]
         st.subheader("Market Overview")
-        st.dataframe(watchlist, use_container_width=True, hide_index=True)
+        if snapshot:
+            st.caption(f"From worker snapshot generated {snapshot.get('generated_at', 'n/a')} (timeframe: {matrix_timeframe})")
+            st.dataframe(snapshot_watchlist(snapshot, matrix_timeframe), use_container_width=True, hide_index=True)
+        else:
+            st.info("No worker snapshot yet. Showing live computation as fallback.")
+            watchlist, _, _ = build_watchlist(matrix_timeframe)
+            st.dataframe(watchlist, use_container_width=True, hide_index=True)
 
         chart_df = load_spot_klines(selected_symbol, selected_timeframe, DEFAULT_CANDLE_LIMIT)
         btc_df = load_spot_klines("BTCUSDC", selected_timeframe, MATRIX_CANDLE_LIMIT)
@@ -489,7 +910,7 @@ with market_tab:
         left, right = st.columns([0.72, 0.28])
         with left:
             st.subheader(f"{selected_symbol} {selected_timeframe}")
-            st.plotly_chart(make_chart(chart_df, selected_analysis, show_elliott), use_container_width=True)
+            st.plotly_chart(make_chart(chart_df, selected_analysis, show_elliott), use_container_width=True, key="market_main_chart")
         with right:
             st.subheader("Scenario")
             st.metric("Read", selected_analysis["scenario"], selected_analysis["confidence"])
@@ -509,10 +930,19 @@ with market_tab:
             render_alerts(selected_analysis["alerts"])
 
         st.subheader("Key Timeframe Matrix")
-        st.dataframe(build_matrix(), use_container_width=True, hide_index=True)
+        if snapshot:
+            st.dataframe(snapshot_matrix(snapshot), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(build_matrix(), use_container_width=True, hide_index=True)
 
         st.subheader(f"{_base_asset(selected_symbol)} Timeframe Comparison")
-        comparison, comparison_read, comparison_confidence, comparison_notes, comparison_alerts, selected_analyses = build_timeframe_comparison(selected_symbol)
+        if snapshot and selected_symbol in snapshot.get("symbols", {}):
+            comparison, comparison_meta = snapshot_comparison(snapshot, selected_symbol)
+            comparison_read = comparison_meta.get("read", "-")
+            comparison_confidence = comparison_meta.get("confidence", "-")
+            comparison_notes = comparison_meta.get("notes", [])
+        else:
+            comparison, comparison_read, comparison_confidence, comparison_notes, _, _ = build_timeframe_comparison(selected_symbol)
         col_a, col_b = st.columns([0.35, 0.65])
         with col_a:
             st.metric("Cross-timeframe read", comparison_read, comparison_confidence)
@@ -520,11 +950,13 @@ with market_tab:
                 st.info(note)
         with col_b:
             st.dataframe(comparison, use_container_width=True, hide_index=True)
-        st.subheader("Comparison Alerts")
-        render_alerts(comparison_alerts)
 
         st.subheader("Active Alerts")
-        render_alerts(alerts)
+        if snapshot:
+            render_alert_dicts(snapshot_alerts(snapshot, matrix_timeframe))
+        else:
+            _, alerts, _ = build_watchlist(matrix_timeframe)
+            render_alerts(alerts)
 
         st.subheader("BNB Relationship Panel")
         render_bnb_relationship(matrix_timeframe)

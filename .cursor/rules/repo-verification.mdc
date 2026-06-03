@@ -4,12 +4,16 @@ alwaysApply: true
 
 # Investment repo verification
 
-Run these after changing app logic, indicators, Binance data access, or signal rules:
+Run these after changing app logic, indicators, Binance data access, signal rules, the ML policy, or storage schema:
 
 ```powershell
 python -m unittest discover -s tests
 python -m compileall app.py src tests
 ```
+
+Notes:
+- Tests that exercise the policy/model must isolate the model path (patch `src.ml.PAPER_POLICY_MODEL_PATH` to a temp file) so they do not read or overwrite the real `data/policy_model.pkl`.
+- New SQLite columns/tables are added via the `ALTER TABLE` migration in `src/storage.py`; the schema test should still find `market_snapshots`, `signal_features`, `paper_trades`, `model_runs`, `policy_state`, and `bot_state`.
 
 For a UI smoke check:
 

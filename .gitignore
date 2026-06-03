@@ -8,3 +8,4 @@ data/*.csv
 data/*.sqlite
 data/*.sqlite-*
 data/worker.log
+data/*.pkl

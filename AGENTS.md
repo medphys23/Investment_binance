@@ -17,7 +17,9 @@ Local Binance technical signal dashboard for monitoring BNB, SUI, SOL, BTC, and 
 - Binance public REST market data via `requests`; spot calls prefer `data-api.binance.vision` because `api.binance.com` may return regional `451` restrictions
 - `pandas` / `numpy` for indicator calculations
 - `plotly` for candlestick, volume, RSI, EMA, Bollinger, Fibonacci, and Elliott Wave overlays
-- `scikit-learn` for batch learning from closed local paper trades
+- `scikit-learn` for the reinforcement-style batch policy learned from closed local paper trades (probability calibration + reward-driven controls)
+- Worker precomputes a JSON `dashboard_snapshot` (in `bot_state`) so the Streamlit app reads SQLite instead of recomputing all symbols/timeframes
+- Installable PWA Monitor view: `.streamlit/config.toml` theme plus an inline manifest/meta injection in `app.py`
 - Tests use the Python standard-library `unittest`
 
 ## Uses from global catalog
@@ -52,9 +54,12 @@ Maintain [`skills.md`](skills.md) beside this file - document repeatable Codex w
 
 - Keep Binance access read-only. Do not add authenticated Binance account endpoints, API keys, real trade placement, order management, withdrawals, or automated exchange execution.
 - Paper trading may open/follow/close local simulated positions only when based on live Binance public market prices. Do not use synthetic market data or manual trade uploads for the active paper bot.
-- Paper trades must be spot-style long simulations only. Bearish setups are `risk_off` / `avoid`, never paper shorts.
+- Paper trades are simulated long and short positions from live public prices only (no exchange execution). Bearish confluence opens `paper_short`; bullish opens `paper_long`; unclear setups stay `observe`.
 - The worker and dashboard share SQLite at `data/paper_bot.sqlite`; generated `data/` outputs must stay out of git.
 - Simulated leverage is research-only, starts at `1x`, and must never exceed `10x`.
+- The ML layer is a reinforcement-style batch policy: retrain every `200` closed trades (`PAPER_POLICY_BATCH`), cold-start pass-through before `50`, time-ordered split + calibration, and reward-driven advisory entry-probability threshold and size multiplier. The size multiplier only scales position size down within the `1%` risk ceiling; gating never overrides the leverage cap or scenario-based rules. Frame it as a reward-driven contextual policy, never a guarantee.
+- Heavy analysis belongs in the worker (`src/analysis_engine.py` `gather_cycle_data` + `build_dashboard_snapshot`), persisted to SQLite; keep the dashboard reading the snapshot with a live fallback only for the single selected chart.
+- New persisted data: extra `signal_features` columns (MACD, ADX, VWAP distance, volatility regime, funding, taker buy/sell, long/short ratio, open interest, BTC correlation), `paper_trades.p_win`/`policy_version`, and a `policy_state` table. Use the lightweight `ALTER TABLE` migration in `src/storage.py` when adding columns so existing databases keep working. The trained model caches at `data/policy_model.pkl` (gitignored).
 - Keep predictions scenario-based: confidence, confluence, invalidation, and likely zones only. Do not present deterministic price guarantees.
 - Treat Elliott Wave detection as probabilistic and explain invalidation/context where surfaced.
 - Prioritize `6h`, `8h`, and `12h` timeframes as first-class regime filters.
